@@ -3,8 +3,6 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include "Eigen-3.3/Eigen/Core"
-#include "Eigen-3.3/Eigen/QR"
 #include "helpers.h"
 #include "json.hpp"
 #include "spline.h"
@@ -14,6 +12,29 @@
 using nlohmann::json;
 using std::string;
 using std::vector;
+
+
+void print(const string &text) {
+    std::cout << text << std::endl;
+}
+
+void printCarInfo(double ref_vel, int current_lane, bool to_close, bool car_left, bool car_right) {
+    std::cout << "Speed: " << ref_vel << " kmh" << std::endl;
+    vector<string> before = {"   ", "   ", "   "};
+    vector<string> my_row = {"   ", "   ", "   "};
+    my_row[current_lane] = " X ";
+    if (to_close) {
+        before[current_lane] = " Ö ";
+    }
+    if (car_left) {
+        my_row[current_lane - 1] = " Ö ";
+    }
+    if (car_right) {
+        my_row[current_lane + 1] = " Ö ";
+    }
+    std::cout << "|   |   |   ||" << before[0] << "|" << before[1] << "|" << before[2] << "|" << std::endl;
+    std::cout << "|   |   |   ||" << my_row[0] << "|" << my_row[1] << "|" << my_row[2] << "|" << std::endl;
+}
 
 int main() {
     uWS::Hub h;
@@ -53,12 +74,11 @@ int main() {
     }
     /** Constants */
     static double MAX_SPEED = 49.5;
-    static double PLANNING_RANGE = 30.0;
-    static int MAX_WAYPOINTS_PLANNED = 50;
+    static int PLANNING_RANGE = 50;
+    static int MAX_WAYPOINTS_PLANNED = 60;
     static double CAR_UPDATE_SPEED = 0.02;
 
-    static double DEACCELERATION = 0.224;
-    static double ACCELERATION = 0.445;
+    static double ACCELERATION = 0.224;
 
     static double MID_LANE_D_OFFSET = 2;
     static double LANE_WIDTH = 4;
@@ -70,7 +90,7 @@ int main() {
 
     h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &current_lane, &ref_vel,
                         &map_waypoints_dx, &map_waypoints_dy]
-                        (uWS::WebSocket <uWS::SERVER> ws, char *data, size_t length,
+                        (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                          uWS::OpCode opCode) {
         // "42" at the start of the message means there's a websocket message event.
         // The 4 signifies a websocket message
@@ -113,34 +133,96 @@ int main() {
                     }
 
                     bool to_close = false;
+                    bool car_left = false;
+                    bool car_right = false;
+                    double car_left_speed = MAX_SPEED;
+                    double car_right_speed = MAX_SPEED;
 
-                    // find ref vel to use
+                    /**
+                     * If to close and no car beside change lane (left prefered)
+                     * If there are cars take the free lane or wait till there is a free lane
+                     */
+
+                    // check cars detected
                     for (auto &fusion_item : sensor_fusion) {
                         // car in my lane
                         float d = fusion_item[6];
 
-                        // If car is within our lane
-                        if (d < (MID_LANE_D_OFFSET + LANE_WIDTH * current_lane + (LANE_WIDTH / 2)) &&
-                            d > (MID_LANE_D_OFFSET + LANE_WIDTH * current_lane - (LANE_WIDTH / 2))) {
-                            double vx = fusion_item[3];
-                            double vy = fusion_item[4];
-                            double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
-                            double check_car_s = fusion_item[5];
+                        double car_lane;
+                        if (d > 0 && d < LANE_WIDTH) {
+                            car_lane = 0;
+                        } else if (d > LANE_WIDTH && d < LANE_WIDTH * 2) {
+                            car_lane = 1;
+                        } else if (d > LANE_WIDTH * 2 && d < LANE_WIDTH * 3) {
+                            car_lane = 2;
+                        } else {
+                            continue;
+                        }
 
-                            check_car_s += ((double) prev_size * CAR_UPDATE_SPEED *
-                                            check_speed); // if using prev points can project s values out
-                            if ((check_car_s > car_s) && ((check_car_s - car_s) < PLANNING_RANGE)) {
-                                // Do your stuff here, lower vel and do not crash
+                        double vx = fusion_item[3];
+                        double vy = fusion_item[4];
+                        double check_speed = sqrt(vx * vx + vy * vy);
+                        double check_car_s = fusion_item[5];
+
+                        check_car_s += ((double) prev_size * CAR_UPDATE_SPEED *
+                                        check_speed); // if using prev points can project s values out
+
+                        // save speeds
+                        if (current_lane == car_lane + 1 && check_car_s > car_s) {
+                            car_left_speed = check_speed;
+                        } else if (current_lane == car_lane - 1 && check_car_s > car_s) {
+                            car_right_speed = check_speed;
+                        }
+
+                        // If car is within our lane
+                        if (current_lane == car_lane) {
+                            // if is car before us and within a given range
+                            if ((check_car_s >= car_s) && (abs(check_car_s - car_s) < PLANNING_RANGE) && check_speed < ref_vel) {
                                 to_close = true;
+                            }
+                        } else {
+                            bool car_in_danger_zone = ((check_car_s >= car_s) && abs(check_car_s - car_s) <
+                                                                                PLANNING_RANGE * 0.5)  // Before me take PLANNING RANGE
+                                                      || ((check_car_s <= car_s) && abs(car_s - check_car_s)
+                                                                                   < (PLANNING_RANGE *
+                                                                                      0.1)); // Behind me take 2/3 Planning RANGE
+                            bool speeding_car_behind = check_speed >= ref_vel && ((check_car_s < car_s) &&
+                                                                                  abs(car_s - check_car_s) <
+                                                                                  PLANNING_RANGE * 0.5);
+                            if (current_lane == car_lane + 1 && (car_in_danger_zone || speeding_car_behind)) {
+                                car_left = true;
+                            } else if (current_lane == car_lane - 1 && (car_in_danger_zone || speeding_car_behind)) {
+                                car_right = true;
                             }
                         }
                     }
 
+
+                    double speed_change = 0;
                     if (to_close) {
-                        ref_vel -= DEACCELERATION;
-                    } else {
-                        ref_vel += ACCELERATION;
-                        ref_vel = ref_vel <= 0 ? 0 : ref_vel >= MAX_SPEED ? MAX_SPEED : ref_vel;
+                        // take the lane where we can speed the fastest if both are free
+                        if (current_lane == 1 && !car_left && !car_right) {
+                            if (car_left_speed >= car_right_speed) {
+                                current_lane -= 1;
+                            } else {
+                                current_lane += 1;
+                            }
+                        }
+                            // We want to change lanes, check if left is possible to go to
+                        else if (current_lane != 0 && !car_left) {
+                            // we can change lane to left
+                            current_lane -= 1;
+                        }
+                            // We can't go left, check right
+                        else if (current_lane != 2 && !car_right) {
+                            current_lane += 1;
+                        }
+
+                        speed_change -= ACCELERATION;
+                    }
+                    // Keep lane and speed up if possible
+                    else if (ref_vel < MAX_SPEED) {
+                        speed_change += ACCELERATION;
                     }
 
 
@@ -159,6 +241,7 @@ int main() {
                         // Use two points that make the path tangent to the car
                         double prev_car_x = car_x - cos(car_yaw);
                         double prev_car_y = car_y - sin(car_yaw);
+                        print("prev size < 2");
 
                         pts_x.push_back(prev_car_x);
                         pts_x.push_back(car_x);
@@ -174,7 +257,8 @@ int main() {
 
                         double ref_x_prev = previous_path_x[prev_size - 2];
                         double ref_y_prev = previous_path_y[prev_size - 2];
-                        ref_yaw = atan2(ref_y - ref_y_prev, ref_y - ref_x_prev);
+
+                        ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
 
                         // use the two points that makes the path tangent to the prev path's and points
                         pts_x.push_back(ref_x_prev);
@@ -188,10 +272,10 @@ int main() {
                     vector<double> next_wp0 = getXY(car_s + PLANNING_RANGE,
                                                     (MID_LANE_D_OFFSET + LANE_WIDTH * current_lane),
                                                     map_waypoints_s, map_waypoints_x, map_waypoints_y);
-                    vector<double> next_wp1 = getXY(car_s + PLANNING_RANGE * 2,
+                    vector<double> next_wp1 = getXY(car_s + (PLANNING_RANGE * 2),
                                                     (MID_LANE_D_OFFSET + LANE_WIDTH * current_lane),
                                                     map_waypoints_s, map_waypoints_x, map_waypoints_y);
-                    vector<double> next_wp2 = getXY(car_s + PLANNING_RANGE * 3,
+                    vector<double> next_wp2 = getXY(car_s + (PLANNING_RANGE * 3),
                                                     (MID_LANE_D_OFFSET + LANE_WIDTH * current_lane),
                                                     map_waypoints_s, map_waypoints_x, map_waypoints_y);
 
@@ -208,13 +292,14 @@ int main() {
                         double shift_x = pts_x[i] - ref_x;
                         double shift_y = pts_y[i] - ref_y;
 
-                        pts_x[i] = (shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw));
-                        pts_y[i] = (shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw));
+                        pts_x[i] = shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw);
+                        pts_y[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
                     }
 
                     // create spline
-                    tk::spline spline;
-                    spline.set_points(pts_x, pts_y);
+                    tk::spline spl;
+                    // Set points
+                    spl.set_points(pts_x, pts_y);
 
                     // Create next points vectors
                     vector<double> next_x_vals;
@@ -228,17 +313,26 @@ int main() {
 
                     // Calculate how to break up the spline points so that we travel at our desired reference velocity
                     double target_x = PLANNING_RANGE;
-                    double target_y = spline(target_x);
-                    double target_dist = sqrt(pow(target_x, 2) + pow(target_y, 2));
+                    double target_y = spl(target_x);
+                    double target_dist = sqrt(target_x * target_x + target_y * target_y);
 
                     double x_add_on = 0.0;
 
                     // Fill the rest evenly to have x points in the list
-                    for (int i = 0; i < MAX_WAYPOINTS_PLANNED - prev_size; i++) {
+                    int number_of_needed_positions = MAX_WAYPOINTS_PLANNED - prev_size;
+                    for (int i = 0; i < number_of_needed_positions; i++) {
 
-                        double N = (target_dist / (CAR_UPDATE_SPEED * ref_vel / 2.24));
-                        double x_point = x_add_on + (target_x) / N;
-                        double y_point = spline(x_point);
+                        // Continuously change speed
+                        ref_vel += speed_change;
+                        if (ref_vel > MAX_SPEED) {
+                            ref_vel = MAX_SPEED;
+                        } else if (ref_vel < ACCELERATION) {
+                            ref_vel = ACCELERATION;
+                        }
+
+                        double N = target_dist / (CAR_UPDATE_SPEED * ref_vel / (ACCELERATION * 10));
+                        double x_point = x_add_on + target_x / N;
+                        double y_point = spl(x_point);
 
                         x_add_on = x_point;
 
@@ -246,8 +340,8 @@ int main() {
                         double y_ref = y_point;
 
                         // transform back to map coord
-                        x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw));
-                        y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw));
+                        x_point = x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw);
+                        y_point = x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw);
 
                         x_point += ref_x;
                         y_point += ref_y;
@@ -256,36 +350,8 @@ int main() {
                         next_y_vals.push_back(y_point);
                     }
 
-                    std::cout << "Speed: " << ref_vel << " kmh" << std::endl;
-                    if (current_lane == 1) {
-                        if(to_close){
-                            std::cout << "Lane: |   |   | 0 |   |   |   |"  << std::endl;
-                        }else{
-                            std::cout << "Lane: |   |   |   |   |   |   |" << std::endl;
-                        }
-
-                        std::cout << "Lane: |   |   |   |   |   |   |" << std::endl;
-                        std::cout << "Lane: |   |   |   | X |   |   |"  << std::endl;
-                    } else if (current_lane == 2) {
-                        if(to_close){
-                            std::cout << "Lane: |   |   |   | 0 |   |   |"  << std::endl;
-                        }else{
-                            std::cout << "Lane: |   |   |   |   |   |   |" << std::endl;
-                        }
-
-                        std::cout << "Lane: |   |   |   |   |   |   |" << std::endl;
-                        std::cout << "Lane: |   |   |   |   | X |   |" << std::endl;
-                    } else if (current_lane == 3) {
-                        if(to_close){
-                            std::cout << "Lane: |   |   |   |   |   | 0 |"  << std::endl;
-                        }else{
-                            std::cout << "Lane: |   |   |   |   |   |   |" << std::endl;
-                        }
-
-                        std::cout << "Lane: |   |   |   |   |   |   |"  << std::endl;
-                        std::cout << "Lane: |   |   |   |   |   | X |" << std::endl;
-                    }
-
+                    // Print console ui
+                    printCarInfo(ref_vel, current_lane, to_close, car_left, car_right);
 
                     // Create json update
                     json msgJson;
@@ -305,11 +371,11 @@ int main() {
         }  // end websocket if
     }); // end h.onMessage
 
-    h.onConnection([&h](uWS::WebSocket <uWS::SERVER> ws, uWS::HttpRequest req) {
+    h.onConnection([&h](uWS::WebSocket<uWS::SERVER> ws, uWS::HttpRequest req) {
         std::cout << "Connected!!!" << std::endl;
     });
 
-    h.onDisconnection([&h](uWS::WebSocket <uWS::SERVER> ws, int code,
+    h.onDisconnection([&h](uWS::WebSocket<uWS::SERVER> ws, int code,
                            char *message, size_t length) {
         ws.close();
         std::cout << "Disconnected" << std::endl;

@@ -243,6 +243,9 @@ void spline::set_points(const std::vector<double>& x,
     int n = (int) x.size();
     // check strict monotonicity of input vector x
     for(int i=0; i<n-1; i++) {
+        if (m_x[i]>=m_x[i+1]){
+            std::cout << "Error" << std::endl;
+        }
         assert(m_x[i]<m_x[i+1]);
     }
 
